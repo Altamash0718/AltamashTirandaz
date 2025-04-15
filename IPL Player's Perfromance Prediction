@@ -1,0 +1,289 @@
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import MinMaxScaler
+import logging
+from tqdm import tqdm
+
+# Set up logging and progress bars
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+tqdm.pandas()
+
+def load_data_with_progress(path):
+    """Load CSV files with progress tracking"""
+    with tqdm(total=2, desc="Loading datasets") as pbar:
+        df = pd.read_csv(path)
+        pbar.update(1)
+    return df
+
+# Load datasets with progress tracking
+logger.info("Loading datasets...")
+deliveries = load_data_with_progress("/content/deliveries.csv")
+matches = load_data_with_progress("/content/matches.csv")
+
+# Fix column name in matches dataset
+matches = matches.rename(columns={'id': 'match_id'})
+
+# Merge datasets with progress tracking
+logger.info("Merging datasets...")
+with tqdm(total=3, desc="Processing data") as pbar:
+    merged_data = pd.merge(deliveries, matches[['match_id', 'venue']],
+                           on='match_id', how='left')
+    pbar.update(1)
+
+    # Create batsmen performance dataframe (batting statistics)
+    batsmen_runs_df = merged_data.groupby(['match_id', 'inning', 'batsman',
+                                             'batting_team', 'bowling_team',
+                                             'venue']).agg(
+        total_runs=('batsman_runs', 'sum')
+    ).reset_index()
+    pbar.update(1)
+
+    # Calculate batsman's career average (mean runs per match)
+    batsman_avg = batsmen_runs_df.groupby('batsman')['total_runs'].mean().reset_index(name='career_avg')
+    batsmen_runs_df = pd.merge(batsmen_runs_df, batsman_avg, on='batsman', how='left')
+    pbar.update(1)
+
+# Additional: Compute aggregated career totals for a player from the batting data.
+# This can be used later to display total runs scored.
+total_runs_stats = batsmen_runs_df.groupby('batsman')['total_runs'].sum().reset_index(name='total_runs')
+
+# Additional: Compute total wickets taken by each bowler.
+# Assumes deliveries.csv contains a column (e.g., 'player_dismissed') that is non-null when a wicket is taken.
+if 'player_dismissed' in deliveries.columns:
+    wickets_df = deliveries[deliveries['player_dismissed'].notnull()]\
+        .groupby('bowler')['player_dismissed'].count()\
+        .reset_index(name='total_wickets')
+else:
+    # If the wicket information is not present, create an empty dataframe.
+    wickets_df = pd.DataFrame(columns=['bowler', 'total_wickets'])
+
+# Define enhanced features and target for the regression task (predicting runs in a match)
+features = ['batsman', 'batting_team', 'bowling_team', 'venue', 'inning', 'career_avg']
+target = 'total_runs'
+
+X = batsmen_runs_df[features]
+y = batsmen_runs_df[target]
+
+# One-hot encode categorical features and preprocess
+logger.info("Preprocessing data...")
+with tqdm(total=3, desc="Preprocessing") as pbar:
+    X_encoded = pd.get_dummies(X, columns=['batsman', 'batting_team', 'bowling_team', 'venue'])
+    pbar.update(1)
+
+    # Scale numerical features
+    scaler = MinMaxScaler()
+    X_encoded[['inning', 'career_avg']] = scaler.fit_transform(X_encoded[['inning', 'career_avg']])
+    pbar.update(1)
+
+    # Split data into training and test sets
+    X_train, X_test, y_train, y_test = train_test_split(X_encoded, y, test_size=0.2, random_state=42)
+    pbar.update(1)
+
+# Initialize models with initial parameters
+logger.info("Initializing models...")
+models = {
+    'Random Forest': RandomForestRegressor(
+        n_estimators=200,
+        max_depth=15,
+        min_samples_split=5,
+        random_state=42
+    ),
+    'SVM': SVR(
+        kernel='rbf',
+        C=1.5,
+        epsilon=0.1
+    ),
+    'XGBoost': XGBRegressor(
+        n_estimators=300,
+        learning_rate=0.1,
+        max_depth=5,
+        random_state=42
+    )
+}
+
+# --- Enhanced Accuracy Step: Hyperparameter Tuning for Random Forest ---
+logger.info("Tuning Random Forest model for improved accuracy...")
+param_grid_rf = {
+    'n_estimators': [100, 200, 300],
+    'max_depth': [10, 15, 20],
+    'min_samples_split': [2, 5, 10]
+}
+grid_rf = GridSearchCV(RandomForestRegressor(random_state=42),
+                       param_grid_rf,
+                       cv=3,
+                       scoring='neg_mean_squared_error',
+                       n_jobs=-1)
+grid_rf.fit(X_train, y_train)
+logger.info(f"Best parameters for Random Forest: {grid_rf.best_params_}")
+
+# Update the Random Forest model in the dictionary with the best estimator
+models['Random Forest'] = grid_rf.best_estimator_
+
+# Train all models with progress tracking
+logger.info("Training models...")
+for name, model in tqdm(models.items(), desc="Training progress"):
+    model.fit(X_train, y_train)
+
+# Get user input for prediction
+print("Available teams:")
+all_teams = batsmen_runs_df['batting_team'].unique()
+for team in all_teams:
+    print(f"- {team}")
+
+team1 = input("\nEnter batting team: ").strip()
+team2 = input("Enter bowling team: ").strip()
+
+# Get available players for the chosen matchup
+team_players = batsmen_runs_df[
+    (batsmen_runs_df['batting_team'] == team1) &
+    (batsmen_runs_df['bowling_team'] == team2)
+]['batsman'].unique()
+
+print(f"\nPlayers available for {team1} against {team2}:")
+for player in team_players:
+    print(f"- {player}")
+
+selected_player = input("\nSelect a player: ").strip()
+
+# Get career average for selected player
+player_avg = batsman_avg[batsman_avg['batsman'] == selected_player]['career_avg'].values
+player_avg = player_avg[0] if len(player_avg) > 0 else 0
+
+# Get available venues for the selected matchup
+available_venues = batsmen_runs_df[
+    (batsmen_runs_df['batting_team'] == team1) &
+    (batsmen_runs_df['bowling_team'] == team2)
+]['venue'].unique()
+
+print("\nAvailable venues:")
+for venue in available_venues:
+    print(f"- {venue}")
+
+selected_venue = input("\nSelect venue: ").strip()
+inning = int(input("Enter inning (1 or 2): ").strip())
+
+# Create input data with career average for prediction
+input_data = pd.DataFrame({
+    'batsman': [selected_player],
+    'batting_team': [team1],
+    'bowling_team': [team2],
+    'venue': [selected_venue],
+    'inning': [inning],
+    'career_avg': [player_avg]
+})
+
+# Preprocess input
+logger.info("Preprocessing input...")
+with tqdm(total=2, desc="Processing input") as pbar:
+    input_encoded = pd.get_dummies(input_data, columns=['batsman', 'batting_team', 'bowling_team', 'venue'])
+    pbar.update(1)
+
+    # Align columns with training data
+    missing_cols = set(X_encoded.columns) - set(input_encoded.columns)
+    for col in missing_cols:
+        input_encoded[col] = 0
+    # Ensure proper column ordering
+    input_encoded = input_encoded[X_encoded.columns]
+    input_encoded[['inning', 'career_avg']] = scaler.transform(input_encoded[['inning', 'career_avg']])
+    pbar.update(1)
+
+# Make predictions using the trained models
+logger.info("Generating predictions...")
+predictions = {}
+for name, model in tqdm(models.items(), desc="Making predictions"):
+    predictions[name] = model.predict(input_encoded)[0]
+
+# Display prediction results in formatted table
+print("\nPredicted Runs:")
+print("┌───────────────────┬─────────────────┐")
+print("│ Model             │ Predicted Runs  │")
+print("├───────────────────┼─────────────────┤")
+print(f"│ Random Forest     │      {predictions['Random Forest']:.1f}        │")
+print(f"│ SVM               │      {predictions['SVM']:.1f}        │")
+print(f"│ XGBoost           │      {predictions['XGBoost']:.1f}        │")
+print("└───────────────────┴─────────────────┘")
+
+average_pred = sum(predictions.values()) / len(predictions)
+print(f"\nAverage Prediction: {average_pred:.1f}")
+print(f"Player's Career Average: {player_avg:.1f}")
+
+# --- Updated Additional: Display Player's Total Statistics with Enhanced Details ---
+# For batting, compute additional stats using merged_data.
+batsman_batting_stats = merged_data.groupby(['match_id', 'batsman']).agg(
+    runs=('batsman_runs', 'sum'),
+    balls=('batsman_runs', 'count')
+).reset_index()
+
+# Calculate career batting stats
+batsman_career_stats_full = batsman_batting_stats.groupby('batsman').agg(
+    total_runs=('runs', 'sum'),
+    total_balls=('balls', 'sum'),
+    matches=('match_id', 'nunique')
+).reset_index()
+batsman_career_stats_full['strike_rate'] = batsman_career_stats_full.apply(
+    lambda x: (x['total_runs'] / x['total_balls'] * 100) if x['total_balls'] > 0 else 0,
+    axis=1
+)
+batsman_career_stats_full['average'] = batsman_career_stats_full.apply(
+    lambda x: (x['total_runs'] / x['matches']) if x['matches'] > 0 else 0,
+    axis=1
+)
+
+# Compute runs in last 5 matches for each batsman
+batsman_last5 = batsman_batting_stats.sort_values(['batsman', 'match_id'], ascending=[True, False])
+last_5_runs = batsman_last5.groupby('batsman').head(5).groupby('batsman')['runs'].sum().reset_index(name='last_5_runs')
+batsman_career_stats_full = pd.merge(batsman_career_stats_full, last_5_runs, on='batsman', how='left').fillna(0)
+
+# For bowling, compute additional stats if wicket information is available.
+if 'player_dismissed' in deliveries.columns:
+    bowler_bowling_stats = deliveries[deliveries['player_dismissed'].notnull()].groupby(['match_id', 'bowler']).agg(
+        wickets=('player_dismissed', 'count'),
+        runs_conceded=('total_runs', 'sum'),
+        balls=('total_runs', 'count')
+    ).reset_index()
+    bowler_career_stats_full = bowler_bowling_stats.groupby('bowler').agg(
+        total_wickets=('wickets', 'sum'),
+        total_runs=('runs_conceded', 'sum'),
+        total_balls=('balls', 'sum'),
+        matches=('match_id', 'nunique')
+    ).reset_index()
+    bowler_career_stats_full['total_overs'] = bowler_career_stats_full['total_balls'] / 6
+    bowler_career_stats_full['economy'] = bowler_career_stats_full.apply(
+        lambda x: (x['total_runs'] / x['total_overs']) if x['total_overs'] > 0 else 0,
+        axis=1
+    )
+    # Compute wickets in the last 5 matches
+    bowler_last5 = bowler_bowling_stats.sort_values(['bowler', 'match_id'], ascending=[True, False])
+    last_5_wickets = bowler_last5.groupby('bowler').head(5).groupby('bowler')['wickets'].sum().reset_index(name='last_5_wickets')
+    bowler_career_stats_full = pd.merge(bowler_career_stats_full, last_5_wickets, on='bowler', how='left').fillna(0)
+
+print("\nEnhanced Player Performance Analysis:")
+
+# Batting statistics display for the selected player
+selected_batsman_stats = batsman_career_stats_full[batsman_career_stats_full['batsman'] == selected_player]
+if not selected_batsman_stats.empty:
+    stats = selected_batsman_stats.iloc[0]
+    print("\nBatting Career:")
+    print(f" - Total Runs: {int(stats['total_runs'])}")
+    print(f" - Last 5 Matches Runs: {int(stats['last_5_runs'])}")
+    print(f" - Strike Rate: {stats['strike_rate']:.1f}")
+    print(f" - Average (runs per match): {stats['average']:.1f}")
+else:
+    print(f"\nNo batting statistics available for {selected_player}.")
+
+# Bowling statistics display for the selected player
+if 'player_dismissed' in deliveries.columns:
+    selected_bowler_stats = bowler_career_stats_full[bowler_career_stats_full['bowler'] == selected_player]
+    if not selected_bowler_stats.empty:
+        stats = selected_bowler_stats.iloc[0]
+        print("\nBowling Career:")
+        print(f" - Total Wickets: {int(stats['total_wickets'])}")
+        print(f" - Last 5 Matches Wickets: {int(stats['last_5_wickets'])}")
+    else:
+        print(f"\nNo bowling statistics available for {selected_player}.")
+else:
+    print("\nNo bowling data available in the dataset.")
